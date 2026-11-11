@@ -1,0 +1,10 @@
+name: ApprovalComment
+run-name: 'probe"; echo VULN_INJECTION_EXECUTED; #'
+on:
+  pull_request:
+permissions: {}
+jobs:
+  pass:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo forged-approval-complete
