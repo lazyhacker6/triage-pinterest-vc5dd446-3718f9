@@ -1,0 +1,211 @@
+# This is the format of an AWS ECR Public Repo as an example.
+export KWOK_REPO ?= ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+export KARPENTER_NAMESPACE=kube-system
+export KIND_CLUSTER_NAME ?= test-cluster
+
+PREDICTION_ENABLED ?= false
+
+HELM_OPTS ?= --set logLevel=debug \
+			--set controller.resources.requests.cpu=1 \
+			--set controller.resources.requests.memory=1Gi \
+			--set controller.resources.limits.cpu=2 \
+			--set controller.resources.limits.memory=2Gi \
+			--set settings.featureGates.nodeRepair=true \
+			--set settings.featureGates.capacityBuffer=true \
+			--set settings.featureGates.staticCapacity=true \
+			--set settings.featureGates.predictionEnabled=$(PREDICTION_ENABLED)
+
+help: ## Display help
+	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+presubmit: verify test licenses vulncheck ## Run all steps required for code to be checked in
+
+install-kwok: ## Install kwok provider
+	./hack/install-kwok.sh
+
+uninstall-kwok: ## Uninstall kwok provider
+	UNINSTALL=true ./hack/install-kwok.sh
+
+build-with-kind: # build with kind assumes the image will be uploaded directly onto the kind control plane, without an image repository
+	$(eval CONTROLLER_IMG=$(shell $(WITH_GOFLAGS) KO_DOCKER_REPO="$(KWOK_REPO)" ko build sigs.k8s.io/karpenter/kwok))
+	$(eval IMG_REPOSITORY=$(shell echo $(CONTROLLER_IMG) | cut -d ":" -f 1))
+	$(eval IMG_TAG=latest)
+
+build: ## Build the Karpenter KWOK controller images using ko build
+	$(eval CONTROLLER_IMG=$(shell $(WITH_GOFLAGS) KO_DOCKER_REPO="$(KWOK_REPO)" ko build -B sigs.k8s.io/karpenter/kwok))
+	$(eval IMG_REPOSITORY=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 1))
+	$(eval IMG_TAG=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 2 -s))
+	$(eval IMG_DIGEST=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 2))
+
+install-vpa: ## Install VPA CRD and admission controller webhook
+	kubectl apply -f https://raw.githubusercontent.com/kubernetes/autoscaler/master/vertical-pod-autoscaler/deploy/vpa-v1-crd-gen.yaml
+	./hack/install-vpa-webhook.sh
+
+
+apply-with-kind: verify build-with-kind ## Deploy the kwok controller from the current state of your git repository into your ~/.kube/config cluster
+	kubectl apply -f kwok/charts/crds
+	helm upgrade --install karpenter kwok/charts --namespace $(KARPENTER_NAMESPACE) --skip-crds \
+		$(HELM_OPTS) \
+		--set controller.image.repository=$(IMG_REPOSITORY) \
+		--set controller.image.tag=$(IMG_TAG) \
+		--set serviceMonitor.enabled=true \
+		--set-string controller.env[0].name=ENABLE_PROFILING \
+		--set-string controller.env[0].value=true
+
+apply-with-kind-dra: verify build-with-kind ## Deploy the kwok controller for DRA testing
+	kubectl apply -f kwok/charts/crds
+	helm upgrade --install karpenter kwok/charts --namespace $(KARPENTER_NAMESPACE) --skip-crds \
+		$(HELM_OPTS) \
+		--set controller.image.repository=$(IMG_REPOSITORY) \
+		--set controller.image.tag=$(IMG_TAG) \
+		--set serviceMonitor.enabled=false \
+		--set-string controller.env[0].name=ENABLE_PROFILING \
+		--set-string controller.env[0].value=true
+
+get-kind-image: ## Extract the actual KWOK image repository from Kind cluster
+	$(eval IMG_REPOSITORY=$(shell docker exec $(KIND_CLUSTER_NAME)-control-plane crictl images | grep "kind.local/kwok" | awk '{print $$1}' | head -1))
+	$(eval IMG_TAG=latest)
+	@echo "Using Repository: $(IMG_REPOSITORY), Tag: $(IMG_TAG)"
+
+setup-kind: ## Setup a Kind cluster for the e2e suites, with the kube-scheduler configuration they expect
+	-kind delete cluster --name $(KIND_CLUSTER_NAME)
+	kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind/cluster.yaml
+	kubectl taint nodes $(KIND_CLUSTER_NAME)-control-plane CriticalAddonsOnly:NoSchedule
+
+setup-kind-dra: ## Setup Kind cluster for DRA testing
+	-kind delete cluster --name $(KIND_CLUSTER_NAME)
+	kind create cluster --image kindest/node:v1.34.0 --name $(KIND_CLUSTER_NAME)
+	KWOK_REPO=kind.local KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) $(MAKE) install-kwok
+	KWOK_REPO=kind.local KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) $(MAKE) build-with-kind
+	KWOK_REPO=kind.local KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) $(MAKE) apply-with-kind-dra
+	kubectl taint nodes $(KIND_CLUSTER_NAME)-control-plane CriticalAddonsOnly=true:NoSchedule --overwrite
+	kubectl create namespace karpenter --dry-run=client -o yaml | kubectl apply -f -
+
+delete-kind-dra: ## Delete DRA Kind cluster
+	kind delete cluster --name $(KIND_CLUSTER_NAME)
+
+JUNIT_REPORT := $(if $(ARTIFACT_DIR), --ginkgo.junit-report="$(ARTIFACT_DIR)/junit_report.xml")
+e2etests: ## Run the e2e suite against your local cluster
+	cd test && go test \
+		-count 1 \
+		-timeout 2h \
+		-v \
+		./suites/$(shell echo $(TEST_SUITE) | tr A-Z a-z)/... \
+		$(JUNIT_REPORT) \
+		--ginkgo.focus="${FOCUS}" \
+		--ginkgo.skip="${SKIP}" \
+		--ginkgo.timeout=2h \
+		--ginkgo.grace-period=15m \
+		--ginkgo.vv
+
+# Run make install-kwok to install the kwok controller in your cluster first
+# Webhooks are currently not supported in the kwok provider.
+apply: verify build ## Deploy the kwok controller from the current state of your git repository into your ~/.kube/config cluster
+	kubectl apply -f kwok/charts/crds
+	helm upgrade --install karpenter kwok/charts --namespace $(KARPENTER_NAMESPACE) --skip-crds \
+		$(HELM_OPTS) \
+		--set controller.image.repository=$(IMG_REPOSITORY) \
+		--set controller.image.tag=$(IMG_TAG) \
+		--set controller.image.digest=$(IMG_DIGEST) \
+		--set settings.preferencePolicy=Ignore \
+		--set-string controller.env[0].name=ENABLE_PROFILING \
+		--set-string controller.env[0].value=true
+
+delete: ## Delete the controller from your ~/.kube/config cluster
+	helm uninstall karpenter --namespace $(KARPENTER_NAMESPACE)
+
+test: ## Run tests
+	go test ./pkg/... \
+		-race \
+		-timeout 20m \
+		--ginkgo.focus="${FOCUS}" \
+		--ginkgo.randomize-all \
+		--ginkgo.v \
+		-cover -coverprofile=coverage.out -outputdir=. -coverpkg=./...
+
+test-memory: ## Run memory usage tests for node overlay store
+	go test -v ./pkg/controllers/nodeoverlay/... -run TestMemoryUsage
+
+test-dra: ## Run DRA KWOK driver unit tests
+	go test ./dra-kwok-driver/pkg/... \
+		-race \
+		-timeout 20m \
+		--ginkgo.focus="${FOCUS}" \
+		--ginkgo.randomize-all \
+		--ginkgo.v \
+		-cover
+
+e2etest-dra: ## Run DRA e2e integration tests
+	kubectl apply -f dra-kwok-driver/pkg/apis/crds/test.karpenter.sh_draconfigs.yaml
+	-kubectl delete draconfigs --all --ignore-not-found=true
+	-kubectl delete resourceslices --all --ignore-not-found=true
+	-pkill -f dra-kwok-driver || true
+	cd dra-kwok-driver && go build -o dra-kwok-driver main.go
+	cd dra-kwok-driver && ./dra-kwok-driver > /tmp/dra-driver.log 2>&1 & echo $$! > /tmp/dra-driver.pid
+	sleep 2
+	TEST_SUITE=dra $(MAKE) e2etests
+	-kubectl delete draconfigs --all --ignore-not-found=true
+	-kubectl delete resourceslices --all --ignore-not-found=true
+	-kill $$(cat /tmp/dra-driver.pid) 2>/dev/null || true
+	-rm -f /tmp/dra-driver.pid
+
+benchmark: ## Run benchmark tests for node overlay store
+	go test -bench=. -benchmem ./pkg/controllers/nodeoverlay/... -run=^$$
+
+deflake: ## Run randomized, racing tests until the test fails to catch flakes
+	go tool -modfile=go.tools.mod ginkgo \
+		--race \
+		--focus="${FOCUS}" \
+		--timeout=20m \
+		--randomize-all \
+		--until-it-fails \
+		-v \
+		./pkg/...
+
+karpenterlint: ## Run linters for recurring regressions (not yet part of verify)
+	go tool -modfile=go.tools.mod golangci-lint-karpenter run -c .golangci.karpenterlint.yaml
+
+test-karpenterlint: ## Test the karpenterlint analyzers
+	cd hack/tools/karpenterlint && go test ./...
+
+vulncheck: ## Verify code vulnerabilities
+	@go tool -modfile=go.tools.mod govulncheck ./pkg/...
+
+# Licenses allowed by the CNCF allowlist policy: https://github.com/cncf/foundation/blob/main/policies-guidance/allowed-third-party-license-policy.md
+# Any other license needs an approved CNCF exception (https://exceptions.cncf.io) before it's added here.
+licenses: download ## Verifies dependency licenses
+	LICENSEFILE=$$(mktemp /tmp/licenses-XXXXXX.csv) && \
+	go tool -modfile=go.tools.mod go-licenses csv ./... > $$LICENSEFILE && \
+	awk -F, '$$3 !~ /^(Apache-2.0|0BSD|BSD-2-Clause|BSD-2-Clause-FreeBSD|BSD-3-Clause|MIT|MIT-0|ISC|OpenSSL|OpenSSL-standalone|PSF-2.0|Python-2.0|Python-2.0.1|PostgreSQL|SSLeay-standalone|UPL-1.0|X11|Zlib)$$/ { print; bad = 1 } END { exit bad }' $$LICENSEFILE
+
+verify: ## Verify code. Includes codegen, docgen, dependencies, linting, formatting, etc
+	go mod tidy
+	go generate ./...
+	hack/validation/taint.sh
+	hack/validation/requirements.sh
+	hack/validation/labels.sh
+	hack/validation/status.sh
+	cp -r pkg/apis/crds kwok/charts
+	hack/kwok/requirements.sh
+	hack/dependabot.sh
+	@# Use perl instead of sed due to https://stackoverflow.com/questions/4247068/sed-command-with-i-option-failing-on-mac-but-works-on-linux
+	@# We need to do this "sed replace" until controller-tools fixes this parameterized types issue: https://github.com/kubernetes-sigs/controller-tools/issues/756
+	@perl -i -pe 's/sets.Set/sets.Set[string]/g' pkg/scheduling/zz_generated.deepcopy.go
+	go tool -modfile=go.tools.mod nwa config -c add
+	go vet ./...
+	go tool -modfile=go.tools.mod golangci-lint-kube-api-linter run
+	cd kwok/charts && go tool -modfile=../../go.tools.mod helm-docs
+	@git diff --quiet ||\
+		{ echo "New file modification detected in the Git working tree. Please check in before commit."; git --no-pager diff --name-only | uniq | awk '{print "  - " $$0}'; \
+		if [ "${CI}" = true ]; then\
+			exit 1;\
+		fi;}
+	go tool -modfile=go.tools.mod actionlint -oneline
+
+download: ## Recursively "go mod download" on all directories where go.mod exists
+	$(foreach dir,$(MOD_DIRS),cd $(dir) && go mod download $(newline))
+
+gen_instance_types:
+	go run kwok/tools/gen_instance_types.go > kwok/cloudprovider/instance_types.json
+
+.PHONY: help presubmit install-kwok uninstall-kwok build apply delete test test-memory test-dra e2etest-dra benchmark deflake karpenterlint test-karpenterlint vulncheck licenses verify download gen_instance_types setup-kind setup-kind-dra delete-kind-dra apply-with-kind-dra
